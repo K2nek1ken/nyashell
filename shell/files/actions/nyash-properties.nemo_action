@@ -1,0 +1,12 @@
+[Nemo Action]
+# «Свойства» в меню ПКМ по папкам слева (у встроенных мест вроде «Загрузок» Немо их не показывает)
+Name=Properties
+Name[ru]=Свойства
+Comment=Show properties of %f
+Comment[ru]=Свойства «%f»
+Exec=gdbus call --session --dest org.freedesktop.FileManager1 --object-path /org/freedesktop/FileManager1 --method org.freedesktop.FileManager1.ShowItemProperties "['%U']" ""
+Icon-Name=document-properties-symbolic
+Selection=s
+Extensions=any;
+Conditions=sidebar-only;
+Dependencies=gdbus;

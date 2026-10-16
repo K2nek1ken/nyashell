@@ -1,0 +1,1278 @@
+diff --git a/include/mango/config/parse_config.h b/include/mango/config/parse_config.h
+index 220325b6..8feb0506 100644
+--- a/include/mango/config/parse_config.h
++++ b/include/mango/config/parse_config.h
+@@ -310,6 +310,7 @@ typedef struct {
+ 	int32_t tag_animation_direction;
+ 	float zoom_initial_ratio;
+ 	float zoom_end_ratio;
++	float nya_drag_scale;
+ 	float fadein_begin_opacity;
+ 	float fadeout_begin_opacity;
+ 	uint32_t animation_duration_move;
+@@ -333,6 +334,15 @@ typedef struct {
+ 	int32_t scroller_prefer_center;
+ 	int32_t scroller_prefer_overspread;
+ 	int32_t edge_scroller_pointer_focus;
++	int32_t nya_minimize_anim;
++	int32_t nya_smart_float;
++	int32_t nya_scroller_half;
++	int32_t nya_grid_snap;
++	int32_t nya_live_drag;
++	int32_t nya_layout_close;
++	int32_t nya_open_from_bottom;
++	int32_t scroller_snap_resize;
++	int32_t scroller_new_at_end;
+ 	double edge_scroller_focus_allow_speed;
+ 	int32_t focus_cross_monitor;
+ 	int32_t focusdir_only_zone_overlap;
+diff --git a/include/mango/manage/client.h b/include/mango/manage/client.h
+index 1c007abc..659ea4af 100644
+--- a/include/mango/manage/client.h
++++ b/include/mango/manage/client.h
+@@ -184,6 +184,10 @@ struct Client {
+ 	Client *swallowdby, *swallowing;
+ 	bool is_clip_to_hide;
+ 	bool drag_to_tile;
++	void *nya_link;
++	int32_t nya_link_side;
++	struct wlr_box nya_slot;
++	bool nya_live_drag;
+ 	bool scratchpad_switching_mon;
+ 	bool scratchpad_tagin;
+ 	bool fake_no_border;
+diff --git a/src/animation/client.c b/src/animation/client.c
+index e904241e..2a2af810 100644
+--- a/src/animation/client.c
++++ b/src/animation/client.c
+@@ -19,6 +19,10 @@
+ #ifdef XWAYLAND
+ #include <wlr/xwayland.h>
+ #endif
++#include <stdlib.h>
++uint32_t get_now_in_ms(void); /* common/util.c */
++
++extern uint32_t nya_anim_until;
+ 
+ static bool client_gesture_driven(const Client *c) {
+ 	return server.gesture_drive_active && c &&
+@@ -113,6 +117,9 @@ bool is_horizontal_right_stack_layout(Monitor *m) {
+ }
+ 
+ int32_t is_special_animation_rule(Client *c) {
++	/* nyashell: all new tiled windows rise from the bottom edge. */
++	if (config.nya_open_from_bottom && !c->isfloating)
++		return DOWN;
+ 	if (is_scroller_layout(c->mon) && !c->isfloating) {
+ 		return DOWN;
+ 	} else if (c->mon->visible_tiling_clients == 1 && !c->isfloating) {
+@@ -1190,6 +1197,33 @@ void fadeout_client_animation_next_tick(Client *c) {
+ 		wlr_scene_node_for_each_buffer(&c->scene->node,
+ 									   scene_buffer_apply_opacity, &opacity);
+ 
++	/* nyashell linked close: shrink with the neighbour, not by the clock */
++	if (c->nya_link && c->nya_link_side >= 0) {
++		/* the link is cleared in handle_client_unmap when the neighbour goes away */
++		Client *n = (Client *)c->nya_link;
++		{
++			struct wlr_box g = c->geom, a = n->animation.current;
++			int32_t lo, hi;
++			width = g.width; height = g.height; x = 0; y = 0;
++			switch (c->nya_link_side) {
++			case 0: /* neighbour grows rightwards from the left */
++				lo = MANGO_MAX(a.x + a.width, g.x); hi = g.x + g.width;
++				width = MANGO_MAX(1, hi - lo); x = hi - width - g.x; break;
++			case 1: /* grows leftwards from the right */
++				lo = g.x; hi = MANGO_MIN(a.x, g.x + g.width);
++				width = MANGO_MAX(1, hi - lo); break;
++			case 2: /* grows downwards from above */
++				lo = MANGO_MAX(a.y + a.height, g.y); hi = g.y + g.height;
++				height = MANGO_MAX(1, hi - lo); y = hi - height - g.y; break;
++			default: /* grows upwards from below */
++				lo = g.y; hi = MANGO_MIN(a.y, g.y + g.height);
++				height = MANGO_MAX(1, hi - lo); break;
++			}
++			wlr_scene_node_set_position(&c->scene->node, x, y);
++			c->animation.current = (struct wlr_box){ .x = x, .y = y, .width = width, .height = height };
++		}
++	}
++
+ 	if (client_close_animation_type(c) == ANIM_TYPE_ZOOM) {
+ 		BufferData buffer_data;
+ 		buffer_data.width = width;
+@@ -1269,6 +1303,61 @@ void client_animation_next_tick(Client *c) {
+ 		c->need_output_flush = false;
+ 	}
+ }
++/* nyashell: in the scroller the windows to the RIGHT of a closed one slide
++ * left into its place — find the one directly to the right */
++static Client *nya_scroller_right_neighbour(Client *c) {
++	const int32_t tol = 64;
++	Client *t;
++	if (!c->mon)
++		return NULL;
++	wl_list_for_each(t, &server.clients, link) {
++		if (t == c || !ISTILED(t) || t->mon != c->mon || !VISIBLEON(t, c->mon))
++			continue;
++		bool vov = t->geom.y < c->geom.y + c->geom.height &&
++				   c->geom.y < t->geom.y + t->geom.height;
++		if (vov && abs(c->geom.x + c->geom.width - t->geom.x) <= tol)
++			return t;
++	}
++	return NULL;
++}
++/* nyashell: which side the tiled neighbour that will take this window's
++ * place is on: 0 left, 1 right, 2 above, 3 below, -1 none. Horizontal
++ * neighbours win, as the grid mostly reflows sideways. */
++static int32_t nya_close_side(Client *c, Client **who) {
++	const int32_t tol = 64; /* gaps, borders */
++	int32_t found = -1;
++	Client *t;
++	*who = NULL;
++	if (!c->mon)
++		return -1;
++	wl_list_for_each(t, &server.clients, link) {
++		if (t == c || !ISTILED(t) || t->mon != c->mon ||
++			!VISIBLEON(t, c->mon))
++			continue;
++		bool vov = t->geom.y < c->geom.y + c->geom.height &&
++				   c->geom.y < t->geom.y + t->geom.height;
++		bool hov = t->geom.x < c->geom.x + c->geom.width &&
++				   c->geom.x < t->geom.x + t->geom.width;
++		if (vov && abs(t->geom.x + t->geom.width - c->geom.x) <= tol) {
++			*who = t;
++			return 0;
++		}
++		if (vov && abs(c->geom.x + c->geom.width - t->geom.x) <= tol) {
++			*who = t;
++			return 1;
++		}
++		if (hov && found < 0 && abs(t->geom.y + t->geom.height - c->geom.y) <= tol) {
++			found = 2;
++			*who = t;
++		}
++		if (hov && found < 0 && abs(c->geom.y + c->geom.height - t->geom.y) <= tol) {
++			found = 3;
++			*who = t;
++		}
++	}
++	return found;
++}
++
+ void init_fadeout_client(Client *c) {
+ 	if (!c->mon || client_is_unmanaged(c))
+ 		return;
+@@ -1332,6 +1421,62 @@ void init_fadeout_client(Client *c) {
+ 		fadeout_client->current.y = 0;
+ 		fadeout_client->current.width = 0;
+ 		fadeout_client->current.height = 0;
++	} else if (config.nya_layout_close && !c->isfloating &&
++			   is_scroller_layout(c->mon) && nya_scroller_right_neighbour(c)) {
++		/* nyashell: scroller, any width preset (1/2, 1/3, 1/4…): the window on
++		 * the right slides into this slot, so the closing window is squashed by
++		 * it into its own left edge, frame by frame (linked, like in the grid) —
++		 * it can no longer linger under a neighbour that has already arrived */
++		int32_t w = fadeout_client->geom.width, h = fadeout_client->geom.height;
++		fadeout_client->nya_link = nya_scroller_right_neighbour(c);
++		fadeout_client->nya_link_side = 1;
++		fadeout_client->current.x = 0;
++		fadeout_client->current.y = 0;
++		fadeout_client->current.width = 1;
++		fadeout_client->current.height = h;
++		(void)w;
++		fadeout_client->animation_type_close = ANIM_TYPE_ZOOM;
++	} else if (config.nya_layout_close && !c->isfloating &&
++			   is_scroller_layout(c->mon)) {
++		/* nyashell: in the scroller a window with nobody beside it falls
++		 * down off the screen. With a neighbour beside it (any width preset:
++		 * 1/2, 1/3, 1/4…) it is squashed by that neighbour instead — the
++		 * same linked collapse as in the grid, so the closing window never
++		 * lingers under a neighbour that has already slid into its place. */
++		fadeout_client->current.x = 0;
++		fadeout_client->current.y =
++			c->mon->m.y + c->mon->m.height - c->animation.current.y;
++		fadeout_client->animation_type_close = ANIM_TYPE_SLIDE;
++	} else if (config.nya_layout_close && !c->isfloating) {
++		/* nyashell: adaptive squash in grid layouts. The window is pushed
++		 * away by the neighbour that takes its place: a neighbour on the
++		 * left grows rightwards, so the window collapses into its right
++		 * edge, and so on. No neighbour — it collapses upwards. The zoom
++		 * code path already resizes the snapshot buffers every tick.
++		 * Sizes are 1, not 0: zero dest size means "natural size". */
++		int32_t w = fadeout_client->geom.width, h = fadeout_client->geom.height;
++		Client *nb = NULL;
++		int32_t side = nya_close_side(c, &nb); /* 0 left,1 right,2 above,3 below */
++		/* linked: the snapshot keeps exactly the part of the old slot the
++		 * neighbour has not covered yet, frame by frame (see the tick) */
++		fadeout_client->nya_link = nb;
++		fadeout_client->nya_link_side = nb ? side : -1;
++		fadeout_client->current.x = 0;
++		fadeout_client->current.y = 0;
++		fadeout_client->current.width = w;
++		fadeout_client->current.height = h;
++		if (side == 0) {            /* neighbour on the left → into the right edge */
++			fadeout_client->current.x = w - 1;
++			fadeout_client->current.width = 1;
++		} else if (side == 1) {     /* neighbour on the right → into the left edge */
++			fadeout_client->current.width = 1;
++		} else if (side == 2) {     /* neighbour above → into the bottom edge */
++			fadeout_client->current.y = h - 1;
++			fadeout_client->current.height = 1;
++		} else {                    /* neighbour below or none → into the top edge */
++			fadeout_client->current.height = 1;
++		}
++		fadeout_client->animation_type_close = ANIM_TYPE_ZOOM;
+ 	} else if (client_close_animation_type(c) == ANIM_TYPE_SLIDE) {
+ 		fadeout_client->current.y =
+ 			c->geom.y + c->geom.height / 2 >= c->mon->m.y + c->mon->m.height / 2
+@@ -1477,7 +1622,10 @@ void client_set_pending_state(Client *c) {
+ 		c->animation.action == OPEN)
+ 		c->animation.duration = 0;
+ 
+-	if (server.start_drag_window) {
++	/* nyashell: while dragging, mango normally skips animations; for a short
++	 * window after a grab or a width snap we let them run, so the window
++	 * eases into its new size instead of jumping */
++	if (server.start_drag_window && get_now_in_ms() >= nya_anim_until) {
+ 		c->animation.should_animate = false;
+ 		c->animation.duration = 0;
+ 	}
+@@ -1697,7 +1845,15 @@ void client_set_unfocused_opacity_animation(Client *c) {
+ 
+ 	client_start_focus_animation(c, false);
+ }
++uint32_t nya_anim_until = 0; /* nyashell: see should_animate above */
++
+ void resize(Client *c, struct wlr_box geo, int32_t interact) {
++	/* nyashell live drag: while a tiled window is being dragged the layout
++	 * only reserves its slot; the window itself follows the cursor. */
++	if (c->nya_live_drag && !interact) {
++		c->nya_slot = geo;
++		return;
++	}
+ 	resize_apply(c, geo, (ResizeOpts){.interact = interact});
+ }
+ 
+diff --git a/src/config/parse_config.c b/src/config/parse_config.c
+index 644c2c61..1ff8ac31 100644
+--- a/src/config/parse_config.c
++++ b/src/config/parse_config.c
+@@ -35,6 +35,17 @@
+ #include <wlr/types/wlr_output_layout.h>
+ #include <wlr/types/wlr_xcursor_manager.h>
+ 
++/* nyashell: пустое действие blockfor (src/dispatch/bind.c) */
++int32_t block_for(const Arg *arg);
++
++/* nyashell: region screenshot selected in the compositor (input/pointer.c) */
++extern void nya_shot_begin(void);
++static int32_t nya_shot_region(const Arg *arg) {
++	(void)arg;
++	nya_shot_begin();
++	return 0;
++}
++
+ #ifndef SYSCONFDIR
+ #define SYSCONFDIR "/etc"
+ #endif
+@@ -552,6 +563,26 @@ bool parse_option(Config *config, char *key, char *value, int line_number) {
+ 		config->scroller_prefer_center = atoi(value);
+ 	} else if (strcmp(key, "scroller_prefer_overspread") == 0) {
+ 		config->scroller_prefer_overspread = atoi(value);
++	} else if (strcmp(key, "scroller_new_at_end") == 0) {
++		config->scroller_new_at_end = atoi(value);
++	} else if (strcmp(key, "scroller_snap_resize") == 0) {
++		config->scroller_snap_resize = atoi(value);
++	} else if (strcmp(key, "nya_open_from_bottom") == 0) {
++		config->nya_open_from_bottom = atoi(value);
++	} else if (strcmp(key, "nya_layout_close") == 0) {
++		config->nya_layout_close = atoi(value);
++	} else if (strcmp(key, "nya_live_drag") == 0) {
++		config->nya_live_drag = atoi(value);
++	} else if (strcmp(key, "nya_drag_scale") == 0) {
++		config->nya_drag_scale = atof(value);
++	} else if (strcmp(key, "nya_grid_snap") == 0) {
++		config->nya_grid_snap = atoi(value);
++	} else if (strcmp(key, "nya_scroller_half") == 0) {
++		config->nya_scroller_half = atoi(value);
++	} else if (strcmp(key, "nya_minimize_anim") == 0) {
++		config->nya_minimize_anim = atoi(value);
++	} else if (strcmp(key, "nya_smart_float") == 0) {
++		config->nya_smart_float = atoi(value);
+ 	} else if (strcmp(key, "edge_scroller_pointer_focus") == 0) {
+ 		config->edge_scroller_pointer_focus = atoi(value);
+ 	} else if (strcmp(key, "edge_scroller_focus_allow_speed") == 0) {
+@@ -2639,8 +2670,14 @@ void reapply_rootbg(void) {
+ 	wlr_scene_rect_set_color(server.root_bg, config.rootcolor);
+ }
+ 
++void client_set_opacity(Client *c, double opacity); /* manage/client.c */
++
+ void reapply_property(void) {
+ 	Client *c = NULL;
++	/* nyashell: window opacity follows the global setting live. Windows that
++	 * still have the previous global values get the new ones; windows whose
++	 * opacity came from a window rule (games, video players) keep theirs. */
++	static float nya_prev_fo = -1.0f, nya_prev_uo = -1.0f;
+ 
+ 	// reset border width when config change
+ 	wl_list_for_each(c, &server.clients, link) {
+@@ -2649,8 +2686,26 @@ void reapply_property(void) {
+ 				c->bw = config.borderpx;
+ 			}
+ 			client_set_group_config(c);
++			bool changed = false;
++			if (nya_prev_fo >= 0.0f && fabsf(c->focused_opacity - nya_prev_fo) < 0.001f &&
++				fabsf(c->focused_opacity - config.focused_opacity) >= 0.001f) {
++				c->focused_opacity = config.focused_opacity;
++				changed = true;
++			}
++			if (nya_prev_uo >= 0.0f && fabsf(c->unfocused_opacity - nya_prev_uo) < 0.001f &&
++				fabsf(c->unfocused_opacity - config.unfocused_opacity) >= 0.001f) {
++				c->unfocused_opacity = config.unfocused_opacity;
++				changed = true;
++			}
++			if (changed && !c->isfullscreen) {
++				double o = c->isfocusing ? c->focused_opacity : c->unfocused_opacity;
++				c->opacity_animation.current_opacity = o;
++				client_set_opacity(c, o);
++			}
+ 		}
+ 	}
++	nya_prev_fo = config.focused_opacity;
++	nya_prev_uo = config.unfocused_opacity;
+ }
+ 
+ void reapply_pointer(void) {
+@@ -3803,6 +3858,16 @@ void override_config(void) {
+ 		CLAMP_INT(config.scroller_prefer_center, 0, 1);
+ 	config.scroller_prefer_overspread =
+ 		CLAMP_INT(config.scroller_prefer_overspread, 0, 1);
++	config.scroller_new_at_end = CLAMP_INT(config.scroller_new_at_end, 0, 1);
++	config.scroller_snap_resize = CLAMP_INT(config.scroller_snap_resize, 0, 1);
++	config.nya_open_from_bottom = CLAMP_INT(config.nya_open_from_bottom, 0, 1);
++	config.nya_layout_close = CLAMP_INT(config.nya_layout_close, 0, 1);
++	config.nya_live_drag = CLAMP_INT(config.nya_live_drag, 0, 1);
++	config.nya_grid_snap = CLAMP_INT(config.nya_grid_snap, 0, 1);
++	config.nya_scroller_half = CLAMP_INT(config.nya_scroller_half, 0, 1);
++	config.nya_minimize_anim = CLAMP_INT(config.nya_minimize_anim, 0, 1);
++	config.nya_smart_float = CLAMP_INT(config.nya_smart_float, 0, 1);
++	config.nya_drag_scale = CLAMP_FLOAT(config.nya_drag_scale, 0.3f, 1.0f);
+ 	config.edge_scroller_pointer_focus =
+ 		CLAMP_INT(config.edge_scroller_pointer_focus, 0, 1);
+ 	config.edge_scroller_focus_allow_speed =
+@@ -4077,6 +4142,16 @@ void set_value_default() {
+ 	config.scroller_focus_center = 0;
+ 	config.scroller_prefer_center = 0;
+ 	config.scroller_prefer_overspread = 1;
++	config.scroller_new_at_end = 0;
++	config.scroller_snap_resize = 0;
++	config.nya_open_from_bottom = 0;
++	config.nya_layout_close = 0;
++	config.nya_live_drag = 0;
++	config.nya_grid_snap = 0;
++	config.nya_scroller_half = 0;
++	config.nya_minimize_anim = 0;
++	config.nya_smart_float = 1;
++	config.nya_drag_scale = 0.85f;
+ 	config.edge_scroller_pointer_focus = 1;
+ 	config.edge_scroller_focus_allow_speed = 0.0f;
+ 	config.focus_cross_monitor = 0;
+@@ -4857,6 +4932,8 @@ FuncType parse_func_name(char *func_name, Arg *arg, char *arg_value,
+ 		func = leave_overview;
+ 	} else if (strcmp(func_name, "togglejump") == 0) {
+ 		func = toggle_jump;
++	} else if (strcmp(func_name, "nya_shot_region") == 0) {
++		func = nya_shot_region;
+ 	} else if (strcmp(func_name, "set_proportion") == 0) {
+ 		func = set_proportion;
+ 		(*arg).f = atof(arg_value);
+@@ -5000,6 +5077,10 @@ FuncType parse_func_name(char *func_name, Arg *arg, char *arg_value,
+ 		(*arg).i = atoi(arg_value);
+ 	} else if (strcmp(func_name, "togglegaps") == 0) {
+ 		func = toggle_gaps;
++	} else if (strcmp(func_name, "blockfor") == 0) {
++		/* nyashell: blockfor,<regex appid> */
++		func = block_for;
++		(*arg).v = strdup(arg_value);
+ 	} else if (strcmp(func_name, "chvt") == 0) {
+ 		func = change_vt;
+ 		(*arg).ui = atoi(arg_value);
+diff --git a/src/dispatch/bind.c b/src/dispatch/bind.c
+index 02e5654f..cd5a28e9 100644
+--- a/src/dispatch/bind.c
++++ b/src/dispatch/bind.c
+@@ -1016,10 +1016,8 @@ int32_t switch_proportion_preset(const Arg *arg) {
+ 		node->scroller_proportion = target_proportion;
+ 	tc->scroller_proportion = target_proportion;
+ 
+-	uint32_t max_client_width =
+-		m->w.width - 2 * config.scroller_structs - config.gappih;
+-	tc->geom.width = max_client_width * target_proportion;
+-
++	/* nyashell: the width is no longer set here — arrange() computes it from
++	 * the proportion and animates the change (setting it first made it jump) */
+ 	arrange(m, false, false);
+ 	return 0;
+ }
+@@ -1801,6 +1799,13 @@ int32_t toggle_global(const Arg *arg) {
+ 	return 0;
+ }
+ 
++/* nyashell: blockfor,<regex appid> — сочетание глушится, только когда в фокусе окно этих программ.
++ * Само действие пустое: решение принимает keyboard_check_keybinding (src/input/keyboard.c) */
++int32_t block_for(const Arg *arg) {
++	(void)arg;
++	return 0;
++}
++
+ int32_t toggle_gaps(const Arg *arg) {
+ 	if (!server.selected_monitor)
+ 		return 0;
+diff --git a/src/input/keyboard.c b/src/input/keyboard.c
+index 12545f4d..c1889dce 100644
+--- a/src/input/keyboard.c
++++ b/src/input/keyboard.c
+@@ -12,6 +12,9 @@
+ #include "mango/manage/misc.h"
+ #include "mango/manage/monitor.h"
+ #include "mango/switcher/switcher.h"
++
++/* nyashell: пустое действие blockfor (src/dispatch/bind.c) */
++int32_t block_for(const Arg *arg);
+ #include <wlr/backend/libinput.h>
+ #include <wlr/interfaces/wlr_keyboard.h>
+ #include <wlr/types/wlr_compositor.h>
+@@ -557,6 +560,8 @@ int32_t keyboard_check_keybinding(uint32_t state, bool is_locked, uint32_t mods,
+ 	int32_t handled = 0;
+ 	const KeyBinding *k;
+ 	int32_t ji;
++	/* nyashell: сочетание с blockfor совпало и в фокусе нужная программа */
++	bool nya_blocked = false;
+ 
+ 	if (is_keyboard_shortcut_inhibitor(
+ 			server.seat->keyboard_state.focused_surface)) {
+@@ -598,6 +603,16 @@ int32_t keyboard_check_keybinding(uint32_t state, bool is_locked, uint32_t mods,
+ 			   keycode == k->keysymcode.keycode.keycode3))) &&
+ 			k->func) {
+ 
++			/* nyashell: blockfor не выполняется как действие. Если в фокусе программа из списка —
++			 * запоминаем, а глушим, только если никакое настоящее сочетание это нажатие не забрало */
++			if (k->func == block_for) {
++				Client *fc = server.selected_monitor ? server.selected_monitor->sel : NULL;
++				const char *appid = fc ? client_get_appid(fc) : NULL;
++				if (k->arg.v && appid && regex_match(k->arg.v, appid))
++					nya_blocked = true;
++				continue;
++			}
++
+ 			if (!k->ispassapply)
+ 				handled = 1;
+ 			else
+@@ -611,6 +626,8 @@ int32_t keyboard_check_keybinding(uint32_t state, bool is_locked, uint32_t mods,
+ 				break;
+ 		}
+ 	}
++	if (!handled && nya_blocked)
++		handled = 1;
+ 	return handled;
+ }
+ 
+@@ -799,6 +816,13 @@ void handle_keyboard_modifiers(struct wl_listener *listener, void *data) {
+ 	if (!group->keyboard->xkb_state)
+ 		return;
+ 
++	/* nyashell: while Super+Shift are held the pointer stops affecting the
++	 * desktop (hover, focus, menus stay put) — ready for a region shot */
++	{
++		extern void nya_shot_arm(uint32_t mods);
++		nya_shot_arm(wlr_keyboard_get_modifiers(group->keyboard));
++	}
++
+ 	if (!mango_im_keyboard_grab_forward_modifiers(group)) {
+ 
+ 		// prev_seat_keyboard records the keyboard that owned the seat before
+diff --git a/src/input/pointer.c b/src/input/pointer.c
+index 337cf1c7..867f84f8 100644
+--- a/src/input/pointer.c
++++ b/src/input/pointer.c
+@@ -35,6 +35,14 @@
+ #endif
+ #include <wlr/util/region.h>
+ 
++#include <math.h>
++#include <stdio.h>
++#include <stdlib.h>
++
++#ifndef TAGMASK /* nyashell: fallback, mango normally defines it */
++#define TAGMASK ((1u << 9) - 1)
++#endif
++
+ static struct LastCursor last_cursor;
+ 
+ static double pointer_surface_scale(Client *c) {
+@@ -789,6 +797,152 @@ void pointer_resize_floating_window(Client *gc, double x, double y) {
+ 	server.grab_offset_y += cdy;
+ }
+ 
++/* nyashell region screenshot: super+shift+LMB press starts the selection
++ * right away (the same press), dragging draws the rectangle, release shoots.
++ * Done in the compositor so no separate tool has to catch a new click. */
++static struct {
++	bool active;
++	bool armed;             /* Super+Shift held: pointer frozen for clients */
++	bool swallow;           /* eat the LMB release after a cancelled selection */
++	double x0, y0;
++	struct wlr_scene_tree *tree;
++	struct wlr_scene_rect *fill, *edge[4];
++} nya_shot;
++
++static void nya_shot_update(void) {
++	double x1 = server.cursor->x, y1 = server.cursor->y;
++	int32_t x = (int32_t)fmin(nya_shot.x0, x1), y = (int32_t)fmin(nya_shot.y0, y1);
++	int32_t w = (int32_t)fabs(x1 - nya_shot.x0), h = (int32_t)fabs(y1 - nya_shot.y0);
++	const int32_t b = 2;
++	wlr_scene_node_set_position(&nya_shot.tree->node, x, y);
++	wlr_scene_rect_set_size(nya_shot.fill, w, h);
++	wlr_scene_rect_set_size(nya_shot.edge[0], w, b);                 /* top */
++	wlr_scene_rect_set_size(nya_shot.edge[1], w, b);                 /* bottom */
++	wlr_scene_node_set_position(&nya_shot.edge[1]->node, 0, h - b);
++	wlr_scene_rect_set_size(nya_shot.edge[2], b, h);                 /* left */
++	wlr_scene_rect_set_size(nya_shot.edge[3], b, h);                 /* right */
++	wlr_scene_node_set_position(&nya_shot.edge[3]->node, w - b, 0);
++}
++
++/* called on every modifier change from the keyboard code */
++void nya_shot_arm(uint32_t mods) {
++	bool want = (mods & WLR_MODIFIER_LOGO) && (mods & WLR_MODIFIER_SHIFT) &&
++				!(mods & (WLR_MODIFIER_CTRL | WLR_MODIFIER_ALT));
++	if (want == nya_shot.armed)
++		return;
++	nya_shot.armed = want;
++	if (want) {
++		wlr_cursor_set_xcursor(server.cursor, server.cursor_manager, "crosshair");
++	} else if (!nya_shot.active) {
++		/* back to normal: give pointer focus to whatever is under it now */
++		wlr_cursor_set_xcursor(server.cursor, server.cursor_manager, "default");
++		pointer_process_motion(0, NULL, 0, 0, 0, 0);
++	}
++}
++
++void nya_shot_begin(void) {
++	if (nya_shot.active)
++		return;
++	const float fill[4] = {0.87f * 0.18f, 0.75f * 0.18f, 0.75f * 0.18f, 0.18f}; /* premultiplied */
++	const float edge[4] = {0.95f, 0.85f, 0.85f, 1.0f};
++	nya_shot.active = true;
++	nya_shot.x0 = server.cursor->x;
++	nya_shot.y0 = server.cursor->y;
++	/* in the root of the scene and raised to the top: above windows AND above
++	 * layer-shell overlays (shell popups), so the frame is never hidden */
++	nya_shot.tree = wlr_scene_tree_create(&server.scene->tree);
++	nya_shot.fill = wlr_scene_rect_create(nya_shot.tree, 0, 0, fill);
++	for (int32_t i = 0; i < 4; i++)
++		nya_shot.edge[i] = wlr_scene_rect_create(nya_shot.tree, 0, 0, edge);
++	wlr_scene_node_raise_to_top(&nya_shot.tree->node);
++	wlr_cursor_set_xcursor(server.cursor, server.cursor_manager, "crosshair");
++	nya_shot_update();
++}
++
++static void nya_shot_cancel(void) {
++	wlr_scene_node_destroy(&nya_shot.tree->node);
++	nya_shot.active = false;
++	nya_shot.swallow = true;
++	if (!nya_shot.armed) {
++		wlr_cursor_set_xcursor(server.cursor, server.cursor_manager, "default");
++		pointer_process_motion(0, NULL, 0, 0, 0, 0);
++	}
++}
++
++static void nya_shot_finish(void) {
++	double x1 = server.cursor->x, y1 = server.cursor->y;
++	int32_t x = (int32_t)fmin(nya_shot.x0, x1), y = (int32_t)fmin(nya_shot.y0, y1);
++	int32_t w = (int32_t)fabs(x1 - nya_shot.x0), h = (int32_t)fabs(y1 - nya_shot.y0);
++	wlr_scene_node_destroy(&nya_shot.tree->node);
++	nya_shot.active = false;
++	if (!nya_shot.armed) {
++		wlr_cursor_set_xcursor(server.cursor, server.cursor_manager, "default");
++		pointer_process_motion(0, NULL, 0, 0, 0, 0);
++	}
++	if (w < 4 || h < 4)
++		return; /* just a click — nothing to shoot */
++	static char cmd[512];
++	snprintf(cmd, sizeof(cmd),
++			 "sh -c 'sleep 0.05; sh \"$HOME/.config/quickshell/nyashell/screenshot.sh\" geom \"%d,%d %dx%d\"'",
++			 x, y, w, h);
++	spawn(&(Arg){.v = cmd});
++}
++
++/* nyashell live drag state */
++static struct {
++	float fx, fy;          /* where the window was grabbed (0..1) */
++	uint32_t started;      /* ms, for the shrink animation */
++	uint32_t last_swap;    /* ms, swap cooldown */
++	Client *swapped;       /* last window we swapped with */
++	uint32_t edge_since;   /* unused now: page switch is instant (kept for layout) */
++	bool edge_armed;       /* the cursor left the edge since the last page switch */
++	bool pages;            /* ctrl was held at grab: may carry across pages */
++	struct wlr_scene_tree *orig_parent; /* scene layer the window lived in before the page drag */
++} nya_drag;
++
++/* nyashell: the shell writes where its page dots are on screen into
++ * $XDG_RUNTIME_DIR/nyash-pagedots ("tag x y w h" per line). We read them once
++ * when a page drag starts; while dragging, the page under the cursor is written
++ * to $XDG_RUNTIME_DIR/nyash-pagehover so the shell can highlight that dot. */
++static struct { int32_t tag, x, y, w, h; } nya_dots[32];
++static int32_t nya_ndots = 0, nya_hover_page = 0;
++static void nya_dots_load(void) {
++	const char *rt = getenv("XDG_RUNTIME_DIR");
++	char path[512];
++	FILE *f;
++	nya_ndots = 0;
++	if (!rt)
++		return;
++	snprintf(path, sizeof(path), "%s/nyash-pagedots", rt);
++	if (!(f = fopen(path, "r")))
++		return;
++	while (nya_ndots < 32 && fscanf(f, "%d %d %d %d %d", &nya_dots[nya_ndots].tag, &nya_dots[nya_ndots].x,
++								   &nya_dots[nya_ndots].y, &nya_dots[nya_ndots].w, &nya_dots[nya_ndots].h) == 5)
++		nya_ndots++;
++	fclose(f);
++}
++static int32_t nya_page_dot_at(double x, double y) {
++	const int32_t pad = 8;
++	for (int32_t i = 0; i < nya_ndots; i++)
++		if (x >= nya_dots[i].x - pad && x <= nya_dots[i].x + nya_dots[i].w + pad &&
++			y >= nya_dots[i].y - pad && y <= nya_dots[i].y + nya_dots[i].h + pad)
++			return nya_dots[i].tag >= 1 && nya_dots[i].tag <= (int32_t)config.tag_num ? nya_dots[i].tag : 0;
++	return 0;
++}
++static void nya_hover_set(int32_t page) {
++	const char *rt = getenv("XDG_RUNTIME_DIR");
++	char path[512];
++	FILE *f;
++	if (page == nya_hover_page || !rt)
++		return;
++	nya_hover_page = page;
++	snprintf(path, sizeof(path), "%s/nyash-pagehover", rt);
++	if ((f = fopen(path, "w"))) {
++		fprintf(f, "%d\n", page);
++		fclose(f);
++	}
++}
++
+ bool pointer_begin_move_resize(Client *gc, uint32_t mode, double x, double y) {
+ 	const char *cursors[] = {"nw-resize", "ne-resize", "sw-resize",
+ 							 "se-resize"};
+@@ -804,6 +958,53 @@ bool pointer_begin_move_resize(Client *gc, uint32_t mode, double x, double y) {
+ 
+ 	server.grab_client = gc;
+ 
++	if (gc->isfloating == 0 && mode == CurMove && config.nya_live_drag &&
++		ISTILED(gc)) {
++		/* nyashell: the window stays tiled, so the others keep their places;
++		 * it gets a bit smaller and follows the cursor, its slot stays
++		 * reserved and moves to wherever the cursor hovers. */
++		gc->nya_slot = gc->geom;
++		gc->nya_live_drag = true;
++		nya_drag.fx = gc->geom.width ? (float)(x - gc->geom.x) / gc->geom.width : 0.5f;
++		nya_drag.fy = gc->geom.height ? (float)(y - gc->geom.y) / gc->geom.height : 0.5f;
++		nya_drag.started = get_now_in_ms();
++		{
++			/* grab: ease the window down to the drag size (mango animates it,
++			 * see nya_anim_until), anchored where the cursor holds it */
++			extern uint32_t nya_anim_until;
++			nya_anim_until = nya_drag.started + 260;
++			struct wlr_box box;
++			box.width = (int32_t)(gc->geom.width * config.nya_drag_scale);
++			box.height = (int32_t)(gc->geom.height * config.nya_drag_scale);
++			box.x = (int32_t)round(x - nya_drag.fx * box.width);
++			box.y = (int32_t)round(y - nya_drag.fy * box.height);
++			resize(gc, box, 1);
++		}
++		nya_drag.last_swap = 0;
++		nya_drag.swapped = NULL;
++		nya_drag.edge_since = 0;
++		nya_drag.edge_armed = true;
++		/* only ctrl+super+LMB carries the window across pages, so a plain
++		 * super drag that brushes the screen edge does nothing unexpected */
++		{
++			struct wlr_keyboard *kb = wlr_seat_get_keyboard(server.seat);
++			nya_drag.pages =
++				kb && (wlr_keyboard_get_modifiers(kb) & WLR_MODIFIER_CTRL);
++		}
++		/* page drag: lift the window above the shell's bar (overlay layer), so
++		 * it can be carried over the page dots and dropped onto one */
++		nya_drag.orig_parent = NULL;
++		if (nya_drag.pages) {
++			nya_drag.orig_parent = gc->scene->node.parent;
++			wlr_scene_node_reparent(&gc->scene->node, server.layers[LyrOverlay]);
++			nya_dots_load();
++		}
++		server.cursor_mode = CurMove;
++		wlr_cursor_set_xcursor(server.cursor, server.cursor_manager, "grab");
++		wlr_scene_node_raise_to_top(&gc->scene->node);
++		return true;
++	}
++
+ 	if (gc->isfloating == 0 && mode == CurMove) {
+ 		gc->drag_to_tile = true;
+ 		exit_scroller_stack(gc);
+@@ -877,6 +1078,31 @@ void pointer_end_grab_client(bool follow_pointer) {
+ 		server.cursor_mode == CurPressed)
+ 		return;
+ 
++	if (gc->nya_live_drag) {
++		/* nyashell: drop — the window flies back into its reserved slot */
++		gc->nya_live_drag = false;
++		server.cursor_mode = CurNormal;
++		server.grab_client = NULL;
++		wlr_seat_pointer_clear_focus(server.seat);
++		if (nya_drag.orig_parent) {
++			wlr_scene_node_reparent(&gc->scene->node, nya_drag.orig_parent);
++			nya_drag.orig_parent = NULL;
++			/* dropped onto a page dot on the bar — move the window to that page */
++			int32_t page = nya_page_dot_at(server.cursor->x, server.cursor->y);
++			nya_hover_set(0);
++			if (page && gc->mon && !(gc->tags & (1u << (page - 1)))) {
++				resize(gc, gc->nya_slot, 0);
++				tag_client(&(Arg){.ui = 1u << (page - 1)}, gc);
++				pointer_process_motion(0, NULL, 0, 0, 0, 0);
++				return;
++			}
++		}
++		resize(gc, gc->nya_slot, 0);
++		arrange(gc->mon, false, false);
++		pointer_process_motion(0, NULL, 0, 0, 0, 0);
++		return;
++	}
++
+ 	server.cursor_mode = CurNormal;
+ 	/* Clear the pointer focus, this way if the cursor is over a surface
+ 	 * we will send an enter event after which the client will provide
+@@ -1012,6 +1238,91 @@ void pointer_process_motion(uint32_t time, struct wlr_input_device *device,
+ 								(int32_t)round(server.cursor->y));
+ 
+ 	/* If we are currently grabbing the mouse, handle and return */
++	if (nya_shot.active) {
++		nya_shot_update();
++		return;
++	}
++	/* armed: the cursor moves, but clients don't see it (no hover/leave) */
++	if (nya_shot.armed && time)
++		return;
++
++	if (server.cursor_mode == CurMove && server.grab_client &&
++		server.grab_client->nya_live_drag) {
++		Client *gc = server.grab_client, *tc = NULL, *hit = NULL;
++		uint32_t now = get_now_in_ms();
++		/* the size was eased at grab time; here the window just follows the
++		 * cursor (during the first ~260 ms each move retargets the animation,
++		 * so it glides after the cursor rather than snapping) */
++		float k = config.nya_drag_scale;
++		struct wlr_box box;
++		box.width = (int32_t)(gc->nya_slot.width * k);
++		box.height = (int32_t)(gc->nya_slot.height * k);
++		box.x = (int32_t)round(server.cursor->x - nya_drag.fx * box.width);
++		box.y = (int32_t)round(server.cursor->y - nya_drag.fy * box.height);
++		resize(gc, box, 1);
++
++		/* Ctrl+Super drag is the "carry to another page" mode: touching the
++		 * left/right screen edge moves the window to the neighbouring page
++		 * at once (wrapping 1 <-> 9, empty pages included). One switch per
++		 * touch: the cursor has to come off the edge before the next one. */
++		if (nya_drag.pages)
++			nya_hover_set(nya_page_dot_at(server.cursor->x, server.cursor->y));
++		Monitor *mm = gc->mon;
++		bool at_left = server.cursor->x <= mm->m.x + 2;
++		bool at_right = server.cursor->x >= mm->m.x + mm->m.width - 3;
++		if (nya_drag.pages && (at_left || at_right)) {
++			/* first touch of the edge — at once; staying at the edge —
++			 * one more page every 300 ms; leave the edge to re-arm */
++			/* only real pointer motion (time != 0) may switch pages, and never
++			 * from inside a switch: tag_client() refreshes the pointer focus,
++			 * which re-enters this function with the cursor still at the edge —
++			 * without the guard that recursed page after page until mango crashed */
++			static bool switching = false;
++			if (time && !switching && (nya_drag.edge_armed || now - nya_drag.edge_since > 300)) {
++				uint32_t cur = mm->tagset[mm->seltags] & TAGMASK;
++				uint32_t first = 1u, last = 1u << 8;
++				uint32_t dst = at_right ? (cur >= last ? first : cur << 1)
++										: (cur <= first ? last : cur >> 1);
++				nya_drag.edge_armed = false;
++				nya_drag.edge_since = now;
++				if (cur && !(cur & (cur - 1)) && (dst & TAGMASK)) {
++					switching = true;
++					tag_client(&(Arg){.ui = dst}, gc);
++					switching = false;
++					server.grab_client = gc;
++					server.cursor_mode = CurMove;
++				}
++			}
++			return;
++		}
++		if (server.cursor->x > mm->m.x + 40 && server.cursor->x < mm->m.x + mm->m.width - 40)
++			nya_drag.edge_armed = true;
++
++		/* hovering over the middle of another tiled window: swap slots.
++		 * Cooldown + "not the same window again" stop the ping-pong. */
++		wl_list_for_each(tc, &server.clients, link) {
++			if (tc == gc || !ISTILED(tc) || tc->mon != gc->mon ||
++				!VISIBLEON(tc, tc->mon))
++				continue;
++			int32_t mx = tc->geom.width / 5, my = tc->geom.height / 5;
++			if (server.cursor->x >= tc->geom.x + mx &&
++				server.cursor->x < tc->geom.x + tc->geom.width - mx &&
++				server.cursor->y >= tc->geom.y + my &&
++				server.cursor->y < tc->geom.y + tc->geom.height - my) {
++				hit = tc;
++				break;
++			}
++		}
++		if (!hit) {
++			nya_drag.swapped = NULL;
++		} else if (hit != nya_drag.swapped && now - nya_drag.last_swap > 280) {
++			nya_drag.swapped = hit;
++			nya_drag.last_swap = now;
++			client_exchange(gc, hit);
++		}
++		return;
++	}
++
+ 	if (server.cursor_mode == CurMove) {
+ 		/* Move the grabbed client to the new position. */
+ 		server.grab_client->iscustomsize = 1;
+@@ -1408,6 +1719,16 @@ bool pointer_process_button_press(struct wlr_pointer_button_event *event) {
+ 
+ 	switch (event->state) {
+ 	case WL_POINTER_BUTTON_STATE_PRESSED:
++		if (!server.session_locked) {
++			if (nya_shot.active && event->button != BTN_LEFT) {
++				nya_shot_cancel();
++				return true;
++			}
++			if (nya_shot.armed && !nya_shot.active && event->button == BTN_LEFT) {
++				nya_shot_begin();
++				return true;
++			}
++		}
+ 		server.cursor_mode = CurPressed;
+ 		set_selected_monitor(
+ 			monitor_at_point(server.cursor->x, server.cursor->y));
+@@ -1482,6 +1803,20 @@ bool pointer_process_button_press(struct wlr_pointer_button_event *event) {
+ 		}
+ 		break;
+ 	case WL_POINTER_BUTTON_STATE_RELEASED:
++		if (nya_shot.active) {
++			if (event->button == BTN_LEFT) {
++				nya_shot_finish();
++				server.cursor_mode = CurNormal;
++			}
++			return true;
++		}
++		if (nya_shot.swallow) {
++			/* the right-click that cancelled, and the left button let go
++			 * afterwards — neither should reach the desktop */
++			if (event->button == BTN_LEFT)
++				nya_shot.swallow = false;
++			return true;
++		}
+ 		/* If you released any buttons, we exit interactive move/resize mode. */
+ 		if (!server.session_locked && server.cursor_mode != CurNormal &&
+ 			server.cursor_mode != CurPressed) {
+diff --git a/src/layout/arrange.c b/src/layout/arrange.c
+index 9cac5b89..bd5ab243 100644
+--- a/src/layout/arrange.c
++++ b/src/layout/arrange.c
+@@ -13,6 +13,11 @@
+ #include "mango/manage/monitor.h"
+ #include <assert.h>
+ #include <wlr/types/wlr_cursor.h>
++uint32_t get_now_in_ms(void); /* common/util.c */
++
++#ifndef TAGMASK /* nyashell: fallback, mango normally defines it */
++#define TAGMASK ((1u << 9) - 1)
++#endif
+ 
+ void set_size_per(Monitor *m, Client *c) {
+ 	Client *fc = NULL;
+@@ -487,6 +492,49 @@ void resize_tile_dwindle(Client *gc, bool isdrag, int32_t offsetx,
+ 	}
+ }
+ 
++/* nyashell: the grid stays even. Dragging a border (super+RMB) far outwards
++ * pushes the neighbour to the next page; dragging it far inwards pulls a
++ * window back from the next page. One action per drag. */
++static bool nya_grid_done = false;
++
++static void nya_grid_gesture(Client *gc, Monitor *m, float my_old,
++							 float adj_old, float delta, int32_t adj_idx,
++							 bool col) {
++	float total = my_old + adj_old;
++	if (nya_grid_done || total <= 0.0f)
++		return;
++	float share = (my_old + delta) / total;
++	uint32_t cur = m->tagset[m->seltags] & TAGMASK;
++	if (!cur || (cur & (cur - 1)))
++		return; /* only when exactly one page is shown */
++	uint32_t next = cur << 1;
++	if (!(next & TAGMASK))
++		return;
++	Client *c;
++	if (share > 0.75f) {
++		wl_list_for_each(c, &server.clients, link) {
++			if (c == gc || c->mon != m || !VISIBLEON(c, m) || !ISTILED(c))
++				continue;
++			if ((col ? c->grid_col_idx : c->grid_row_idx) != adj_idx)
++				continue;
++			c->tags = next;
++			nya_grid_done = true;
++			arrange(m, true, false);
++			return;
++		}
++	} else if (share < 0.25f) {
++		wl_list_for_each(c, &server.clients, link) {
++			if (c->mon != m || c->isfloating || c->isfullscreen ||
++				!(c->tags & next))
++				continue;
++			c->tags = cur;
++			nya_grid_done = true;
++			arrange(m, true, false);
++			return;
++		}
++	}
++}
++
+ void resize_tile_grid_fair(Client *gc, bool isdrag, int32_t offsetx,
+ 						   int32_t offsety, uint32_t time) {
+ 	if (!gc || gc->isfullscreen || gc->ismaximizescreen)
+@@ -522,6 +570,7 @@ void resize_tile_grid_fair(Client *gc, bool isdrag, int32_t offsetx,
+ 		gc->cursor_in_upper_half =
+ 			server.cursor->y < gc->geom.y + gc->geom.height / 2;
+ 		gc->drag_begin_geom = gc->geom;
++		nya_grid_done = false;
+ 	} else {
+ 		if (isdrag) {
+ 			offsetx = server.cursor->x - server.drag_begin_cursor_x;
+@@ -629,6 +678,11 @@ void resize_tile_grid_fair(Client *gc, bool isdrag, int32_t offsetx,
+ 				dx_clamped = 0.1f - my_old_col;
+ 			if (adj_old_col - dx_clamped < 0.1f)
+ 				dx_clamped = adj_old_col - 0.1f;
++			if (config.nya_grid_snap) {
++				nya_grid_gesture(gc, m, my_old_col, adj_old_col, dx_clamped,
++								 adj_c_idx, true);
++				dx_clamped = 0.0f;
++			}
+ 
+ 			float new_my_col = my_old_col + dx_clamped;
+ 			float new_adj_col = adj_old_col - dx_clamped;
+@@ -704,6 +758,11 @@ void resize_tile_grid_fair(Client *gc, bool isdrag, int32_t offsetx,
+ 				dy_clamped = 0.1f - my_old_row;
+ 			if (adj_old_row - dy_clamped < 0.1f)
+ 				dy_clamped = adj_old_row - 0.1f;
++			if (config.nya_grid_snap) {
++				nya_grid_gesture(gc, m, my_old_row, adj_old_row, dy_clamped,
++								 adj_r_idx, false);
++				dy_clamped = 0.0f;
++			}
+ 
+ 			float new_my_row = my_old_row + dy_clamped;
+ 			float new_adj_row = adj_old_row - dy_clamped;
+@@ -945,6 +1004,25 @@ void resize_tile_scroller(Client *gc, bool isdrag, int32_t offsetx,
+ 			fmaxf(0.1f, fminf(1.0f, new_scroller_proportion));
+ 		new_stack_proportion = fmaxf(0.1f, fminf(0.9f, new_stack_proportion));
+ 
++		/* nyashell: snaps the width to the nearest preset while dragging. */
++		if (isdrag && config.scroller_snap_resize &&
++			config.scroller_proportion_preset_count > 0) {
++			float best = config.scroller_proportion_preset[0];
++			for (int32_t i = 1; i < config.scroller_proportion_preset_count;
++				 i++) {
++				if (fabsf(config.scroller_proportion_preset[i] -
++						  new_scroller_proportion) <
++					fabsf(best - new_scroller_proportion))
++					best = config.scroller_proportion_preset[i];
++			}
++			/* the snap jumps to another preset: let it animate */
++			if (fabsf(best - headnode->scroller_proportion) > 0.001f) {
++				extern uint32_t nya_anim_until;
++				nya_anim_until = get_now_in_ms() + (uint32_t)config.animation_duration_move;
++			}
++			new_scroller_proportion = best;
++		}
++
+ 		// Keeps the sum at 1 so later arrange normalization does not swallow
+ 		// the offset.
+ 		if (isdrag) {
+diff --git a/src/layout/scroll.c b/src/layout/scroll.c
+index dd0c5b70..1c6d274f 100644
+--- a/src/layout/scroll.c
++++ b/src/layout/scroll.c
+@@ -1,4 +1,5 @@
+ #include "mango/layout/scroll.h"
++#include <math.h>
+ #include "mango/common/server.h"
+ #include "mango/common/util.h"
+ #include "mango/layout/arrange.h"
+@@ -352,6 +353,30 @@ void scroller(Monitor *m) {
+ 	int32_t max_client_width =
+ 		m->w.width - 2 * config.scroller_structs - cur_gappih;
+ 
++	/* nyashell: exactly two windows of the same (untouched) width share the
++	 * screen in halves instead of leaving an empty third. */
++	if (config.nya_scroller_half && n_heads == 2 &&
++		!heads[0]->client->isfullscreen && !heads[1]->client->isfullscreen &&
++		!heads[0]->client->ismaximizescreen &&
++		!heads[1]->client->ismaximizescreen &&
++		fabsf(heads[0]->scroller_proportion - heads[1]->scroller_proportion) <
++			0.01f &&
++		heads[0]->scroller_proportion <= 0.5f) {
++		int32_t full = m->w.width - 2 * cur_gappoh;
++		int32_t half = (full - cur_gappih) / 2;
++		for (int32_t i = 0; i < 2; i++) {
++			struct wlr_box g;
++			g.height = m->w.height - 2 * cur_gappov;
++			g.width = half;
++			g.x = m->w.x + cur_gappoh + i * (half + cur_gappih);
++			g.y = m->w.y + (m->w.height - g.height) / 2;
++			arrange_stack_node(heads[i], g, cur_gappiv);
++		}
++		sync_scroller_state_to_clients(m, tag);
++		free(heads);
++		return;
++	}
++
+ 	/* Single-client special case. */
+ 	if (n_heads == 1 && !scroller_ignore_proportion_single &&
+ 		!heads[0]->client->isfullscreen &&
+@@ -530,6 +555,48 @@ void scroller(Monitor *m) {
+ 		arrange_stack_node(cur, right_geom, cur_gappiv);
+ 	}
+ 
++	/* nyashell: no empty space at the ends of the strip. When the last (or
++	 * first) column is closed, the focus moves to its neighbour, which keeps
++	 * its place — and the screen is left with a hole where the closed window
++	 * was. If one end of the strip leaves a gap while the other end still
++	 * hangs off screen, slide the whole strip so that the end sits at the edge
++	 * again (as far as the off-screen part allows). */
++	/* one or two windows have their own placement (single proportion, halves) */
++	bool nya_can_slide = n_heads > 2 && !server.start_drag_window;
++	for (int i = 0; i < n_heads && nya_can_slide; i++)
++		if (heads[i]->client->isfullscreen ||
++			heads[i]->client->ismaximizescreen)
++			nya_can_slide = false;
++	if (nya_can_slide) {
++		Client *first = heads[0]->client, *last = heads[n_heads - 1]->client;
++		int32_t lim_l = m->w.x + config.scroller_structs;
++		int32_t lim_r = m->w.x + m->w.width - config.scroller_structs;
++		int32_t right = last->geom.x + last->geom.width;
++		int32_t dx = 0;
++		if (right < lim_r && first->geom.x < lim_l) {
++			dx = lim_r - right; /* gap on the right: slide right */
++			if (dx > lim_l - first->geom.x)
++				dx = lim_l - first->geom.x;
++		} else if (first->geom.x > lim_l && right > lim_r) {
++			dx = lim_l - first->geom.x; /* gap on the left: slide left */
++			if (-dx > right - lim_r)
++				dx = -(right - lim_r);
++		}
++		if (dx != 0) {
++			int32_t xs[n_heads];
++			for (int i = 0; i < n_heads; i++)
++				xs[i] = heads[i]->client->geom.x;
++			for (int i = 0; i < n_heads; i++) {
++				struct wlr_box g;
++				g.height = m->w.height - 2 * cur_gappov;
++				g.width = max_client_width * heads[i]->scroller_proportion;
++				g.x = xs[i] + dx;
++				g.y = m->w.y + (m->w.height - g.height) / 2;
++				arrange_stack_node(heads[i], g, cur_gappiv);
++			}
++		}
++	}
++
+ 	sync_scroller_state_to_clients(m, tag);
+ 	free(heads);
+ }
+diff --git a/src/manage/client.c b/src/manage/client.c
+index 45ea9e61..4f820064 100644
+--- a/src/manage/client.c
++++ b/src/manage/client.c
+@@ -48,6 +48,7 @@
+ #include <wlr/xwayland.h>
+ #include <xcb/xcb_icccm.h>
+ #endif
++#include <strings.h> /* nyashell: strcasecmp */
+ 
+ /* Placeholder appid/title used when no client surface type can be matched. */
+ static const char broken[] = "broken";
+@@ -238,6 +239,58 @@ const char *client_get_title(Client *c) {
+ 	return c->surface.xdg->toplevel->title ? c->surface.xdg->toplevel->title
+ 										   : "broken";
+ }
++/* nyashell: «второстепенное окно» — по заголовку, как это принято в Qt/KDE и многих других программах:
++ * окна-спутники называются «Что-то — Программа», где «Программа» — заголовок уже открытого главного окна
++ * этой же программы (Prism: «Settings — Prism Launcher 11.1.1» при главном «Prism Launcher 11.1.1»).
++ * У таких окон часто нет ни родителя, ни типа «диалог», поэтому по обычным признакам они тайлились */
++static bool nya_has_affix(const char *t, const char *main) {
++	static const char *seps[] = {" — ", " – ", " - ", " | "};
++	size_t lt = strlen(t), lm = strlen(main);
++	for (size_t i = 0; i < sizeof(seps) / sizeof(seps[0]); i++) {
++		size_t ls = strlen(seps[i]);
++		if (lt <= lm + ls)
++			continue;
++		/* «Что-то — Программа» */
++		if (strcmp(t + lt - lm, main) == 0 &&
++			strncmp(t + lt - lm - ls, seps[i], ls) == 0)
++			return true;
++		/* «Программа — что-то» */
++		if (strncmp(t, main, lm) == 0 && strncmp(t + lm, seps[i], ls) == 0)
++			return true;
++	}
++	return false;
++}
++
++static bool nya_is_secondary(Client *c) {
++	const char *appid = client_get_appid(c), *title = client_get_title(c);
++	Client *o;
++
++	if (!config.nya_smart_float || !appid || !title || !*title)
++		return false;
++	wl_list_for_each(o, &server.clients, link) {
++		const char *oa, *ot;
++		if (o == c || o->iskilling)
++			continue;
++		oa = client_get_appid(o);
++		ot = client_get_title(o);
++		if (!oa || !ot || strlen(ot) < 4 || strcmp(oa, appid) != 0)
++			continue;
++		if (nya_has_affix(title, ot))
++			return true;
++		/* главное окно названо просто именем программы («Steam» у steam) — тогда окно «Steam Settings»
++		 * тоже её спутник. Сравниваем с последней частью app id (org.prismlauncher.PrismLauncher → PrismLauncher) */
++		{
++			const char *base = strrchr(appid, '.');
++			size_t lo = strlen(ot);
++			base = base ? base + 1 : appid;
++			if (strcasecmp(ot, base) == 0 && strncmp(title, ot, lo) == 0 &&
++				title[lo] == ' ' && title[lo + 1] != '\0')
++				return true;
++		}
++	}
++	return false;
++}
++
+ int32_t client_is_float_type(Client *c) {
+ 	struct wlr_xdg_toplevel *toplevel;
+ 	struct wlr_xdg_toplevel_state state;
+@@ -247,9 +300,8 @@ int32_t client_is_float_type(Client *c) {
+ 		struct wlr_xwayland_surface *surface = c->surface.xwayland;
+ 		xcb_size_hints_t *size_hints = surface->size_hints;
+ 
+-		if (!size_hints)
+-			return 0;
+-
++		/* nyashell: окна без size hints раньше сразу считались обычными — даже модальные и диалоги
++		 * (часть окон Steam, Java/Qt-лаунчеров). Тип окна проверяем до size hints */
+ 		if (surface->modal)
+ 			return 1;
+ 
+@@ -1438,7 +1490,7 @@ void client_apply_rules(Client *c) {
+ 	Monitor *mon =
+ 		parent && parent->mon ? parent->mon : server.selected_monitor;
+ 
+-	c->isfloating = client_is_float_type(c) || parent;
++	c->isfloating = client_is_float_type(c) || parent || nya_is_secondary(c);
+ 
+ 	client_update_geometry(c);
+ 
+@@ -1447,6 +1499,10 @@ void client_apply_rules(Client *c) {
+ 	if (!(title = client_get_title(c)))
+ 		title = broken;
+ 
++	/* nyashell: одному окну — не больше одного одноразового правила (windowrule-once). Так шелл раскладывает
++	 * восстановленный сеанс: три окна kitty на разных страницах = три одноразовых правила подряд, и каждое
++	 * достаётся своему окну, а не все — первому */
++	bool nya_once_done = false;
+ 	for (i = 0; i < config.window_rules_count; i++) {
+ 
+ 		r = &config.window_rules[i];
+@@ -1458,6 +1514,10 @@ void client_apply_rules(Client *c) {
+ 		if (r->is_once && r->is_once_applied) {
+ 			continue;
+ 		}
++		if (r->is_once && nya_once_done)
++			continue;
++		if (r->is_once)
++			nya_once_done = true;
+ 
+ 		if (r->is_once &&
+ 			(client_is_x11(c) || !c->surface.xdg->initial_commit)) {
+@@ -2124,7 +2184,7 @@ void handle_client_map(struct wl_listener *listener, void *data) {
+ 		wl_list_insert(&server.clients,
+ 					   &c->link); // The new window is master; its head is
+ 								  // pushed to the stack.
+-	else if (server.selected_monitor &&
++	else if (!config.scroller_new_at_end && server.selected_monitor &&
+ 			 is_scroller_layout(server.selected_monitor) &&
+ 			 server.selected_monitor->visible_scroll_tiling_clients > 0) {
+ 
+@@ -2266,6 +2326,16 @@ void handle_client_unmap(struct wl_listener *listener, void *data) {
+ 	Client *nextfocus = NULL;
+ 	c->iskilling = 1;
+ 	switcher_remove_client(c);
++	/* nyashell: close snapshots linked to this window must forget it */
++	{
++		Client *fc;
++		wl_list_for_each(fc, &server.fadeout_clients, fadeout_link) {
++			if (fc->nya_link == c) {
++				fc->nya_link = NULL;
++				fc->nya_link_side = -1;
++			}
++		}
++	}
+ 	struct ScrollerStackNode *target_node =
+ 		c->mon ? find_scroller_node(
+ 					 c->mon->pertag->scroller_state[get_client_tag_idx(c)], c)
+@@ -3249,6 +3319,11 @@ void set_minimized(Client *c) {
+ 
+ 	c->isglobal = 0;
+ 
++	/* nyashell: minimizing plays the close animation (a snapshot of the
++	 * window leaves the screen) instead of vanishing instantly */
++	if (config.nya_minimize_anim && !c->isnoanimation && VISIBLEON(c, c->mon))
++		init_fadeout_client(c);
++
+ 	c->oldtags = c->mon->tagset[c->mon->seltags];
+ 	c->tags = 0;
+ 	client_pending_minimized_state(c, 1);
+@@ -3281,6 +3356,9 @@ void unminimize(Client *c) {
+ 
+ 	if (c->isminimized) {
+ 		set_size_per(c->mon, c);
++		/* nyashell: restoring plays the open animation */
++		if (config.nya_minimize_anim && !c->isnoanimation)
++			c->is_pending_open_animation = true;
+ 		c->tags = c->mon->tagset[c->mon->seltags];
+ 		c->is_in_scratchpad = 0;
+ 		c->isnamedscratchpad = 0;
+diff --git a/src/manage/monitor.c b/src/manage/monitor.c
+index e191c748..a38becd7 100644
+--- a/src/manage/monitor.c
++++ b/src/manage/monitor.c
+@@ -364,6 +364,15 @@ bool mango_scene_output_commit(struct wlr_scene_output *scene_output,
+ 	if (!state_changed && !wlr_scene_output_needs_frame(scene_output))
+ 		return true;
+ 
++	/* nyashell: "real" blur (blur_optimized=0) blurs whatever is under a
++	 * window, so when anything changes the blur behind every window must be
++	 * redrawn too. scenefx only re-renders the damaged area plus a margin,
++	 * and the leftovers showed up as flickering rectangles. When something
++	 * changed this frame, redraw the whole output instead — costs a bit more
++	 * GPU while things move, nothing at all while the screen is still. */
++	if (config.blur && !config.blur_optimized)
++		wlr_damage_ring_add_whole(&scene_output->damage_ring);
++
+ 	// build the state, attaching the scene's Buffer to it
+ 	bool has_img_desc =
+ 		(state->committed & WLR_OUTPUT_STATE_IMAGE_DESCRIPTION) ||

@@ -1,0 +1,6 @@
+# демонстрация экрана: приложение спрашивает «что показать» — выбираешь экран кликом (slurp)
+# screen sharing: the app asks what to share, you pick the screen with a click (slurp)
+[screencast]
+max_fps=60
+chooser_type=simple
+chooser_cmd=slurp -f %o -or -b 00000055 -c dfbfbeff

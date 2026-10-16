@@ -1,0 +1,13 @@
+[Nemo Action]
+# «Открыть в терминале» по ПКМ на папке слева
+Name=Open in Terminal
+Name[ru]=Открыть в терминале
+Comment=Open a terminal in %f
+Comment[ru]=Открыть терминал в «%f»
+Exec=sh -c 'cd "$1" && exec kitty' sh %F
+Quote=double
+Icon-Name=utilities-terminal-symbolic
+Selection=s
+Extensions=dir;
+Conditions=sidebar-only;
+Dependencies=kitty;

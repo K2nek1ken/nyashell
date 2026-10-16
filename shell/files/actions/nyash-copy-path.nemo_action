@@ -1,0 +1,13 @@
+[Nemo Action]
+# «Копировать путь» — и по ПКМ на папке слева, и на файлах в окне
+Name=Copy Path
+Name[ru]=Копировать путь
+Comment=Copy the full path of %f
+Comment[ru]=Скопировать полный путь «%f»
+Exec=sh -c 'printf "%%s" "$*" | wl-copy' sh %F
+Quote=double
+Icon-Name=edit-copy-symbolic
+Selection=notnone
+Extensions=any;
+Conditions=sidebar-allow;
+Dependencies=wl-copy;
